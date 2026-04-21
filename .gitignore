@@ -1,0 +1,53 @@
+# ----------------------------
+# ENV & SECRETS
+# ----------------------------
+.env
+.streamlit/secrets.toml
+
+# ----------------------------
+# VIRTUAL ENV
+# ----------------------------
+venv/
+.venv/
+
+# ----------------------------
+# PYTHON CACHE
+# ----------------------------
+__pycache__/
+*.pyc
+*.pyo
+
+# ----------------------------
+# DATA & MODELS (GENERATED)
+# ----------------------------
+faiss_index.bin
+chunks.pkl
+data/
+*.pdf
+
+# ----------------------------
+# EVALUATION OUTPUTS
+# ----------------------------
+eval_results.json
+eval_summary.txt
+
+# ----------------------------
+# TEST FILES
+# ----------------------------
+test.py
+test1.py
+test_*.py
+*_test.py
+gemini_test.py
+claude_test.py
+
+# ----------------------------
+# SYSTEM FILES
+# ----------------------------
+.DS_Store
+Thumbs.db
+
+# ----------------------------
+# OPTIONAL
+# ----------------------------
+*.log
