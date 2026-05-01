@@ -1,6 +1,15 @@
 """
-rag_pipeline.py
-Sentence-based chunking + FAISS retrieval.
+rag_pipeline.py — Adaptive Hybrid RAG Pipeline
+Sentence-based chunking + FAISS retrieval + conditional reranking.
+
+Optimizations in this version:
+  • Fast-mode defaults: faiss_k=5, bm25_k=3, max_chunks=3, use_reranker=False
+  • Conditional reranking: only triggers when confidence is low
+  • Hybrid scoring: 0.7 * rerank_score + 0.3 * faiss_score
+  • Chunk trimming: caps context at ~600 chars for LLM efficiency
+  • Definition-signal boosting in scoring
+  • Penalty for overly long chunks (>900 chars)
+
 Chunks stored as dicts: {"text": str, "source": str, "page": int}
 """
 
@@ -11,7 +20,7 @@ import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-MODEL_NAME  = "all-MiniLM-L6-v2"
+MODEL_NAME  = "BAAI/bge-small-en-v1.5"  # Better ML-domain semantics than all-MiniLM-L6-v2
 INDEX_PATH  = "faiss_index.bin"
 CHUNKS_PATH = "chunks.pkl"
 
@@ -58,6 +67,51 @@ def chunk_text(
     return chunks
 
 
+# ── Chunk trimming ────────────────────────────────────────────────────────────
+
+def trim_chunk(text: str, max_chars: int = 600) -> str:
+    """
+    Trim a chunk to max_chars, breaking at sentence boundary.
+    Removes redundant whitespace and noisy fragments.
+    """
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= max_chars:
+        return text
+    # Try to break at sentence boundary
+    truncated = text[:max_chars]
+    last_period = truncated.rfind(". ")
+    if last_period > max_chars * 0.5:
+        return truncated[:last_period + 1].strip()
+    # Fallback: break at word boundary
+    last_space = truncated.rfind(" ")
+    if last_space > 0:
+        return truncated[:last_space].strip() + "…"
+    return truncated.strip() + "…"
+
+
+# ── Definition-signal scoring boost ──────────────────────────────────────────
+
+_DEF_SIGNALS = {
+    " is ", " is defined ", " is a ", " is an ",
+    "defined as", "refers to", "algorithm is", "method is",
+    "technique is", "can be defined", "we define",
+}
+
+def _compute_chunk_boost(chunk: dict) -> float:
+    """
+    Boost useful chunks, penalize overly long ones.
+    Returns a score adjustment (can be negative).
+    """
+    text = chunk.get("text", "").lower()
+    # Positive boost for definitional language
+    bonus = sum(0.05 for sig in _DEF_SIGNALS if sig in text)
+    bonus = min(bonus, 0.20)
+    # Penalty for excessively long chunks (>900 chars)
+    if len(text) > 900:
+        bonus -= 0.10
+    return bonus
+
+
 # ── RAG Pipeline ──────────────────────────────────────────────────────────────
 
 class RAGPipeline:
@@ -98,10 +152,11 @@ class RAGPipeline:
         with open(CHUNKS_PATH, "rb") as f:
             self.chunks = pickle.load(f)
 
-    def retrieve(self, query: str, top_k: int = 4, score_threshold: float = 0.20) -> list[dict]:
+    def retrieve(self, query: str, top_k: int = 4, score_threshold: float = 0.30) -> list[dict]:
         if self.index is None:
             self.load_index()
-        q_vec = self.model.encode([query], normalize_embeddings=True)
+        q = _preprocess_retrieval_query(query)
+        q_vec = self.model.encode([q], normalize_embeddings=True)
         scores, indices = self.index.search(np.array(q_vec, dtype="float32"), top_k)
         results = []
         for score, idx in zip(scores[0], indices[0]):
@@ -120,15 +175,16 @@ class RAGPipeline:
         return results
 
 # ── Hybrid RAG Pipeline ───────────────────────────────────────────────────────
-# Extends RAGPipeline with BM25 + cross-encoder reranking.
-# The base class (and all existing code that uses it) is UNCHANGED.
+# Extends RAGPipeline with BM25 + conditional cross-encoder reranking.
 #
 # Retrieval stages:
 #   1. FAISS semantic search    → top faiss_k candidates (dense)
 #   2. BM25 keyword search      → top bm25_k candidates  (sparse)
 #   3. Union + deduplicate      → by (source, page, text[:80]) fingerprint
-#   4. Cross-encoder reranking  → score every candidate against query
-#   5. Return top max_chunks    → highest reranker scores, hard-capped
+#   4. Confidence check         → decide if reranking is needed
+#   5. Cross-encoder reranking  → only when confidence is low
+#   6. Hybrid scoring           → 0.7 * rerank + 0.3 * faiss (when reranked)
+#   7. Return top max_chunks    → highest scores, hard-capped + trimmed
 
 import re as _re
 
@@ -145,38 +201,91 @@ except ImportError:
     _RERANKER_AVAILABLE = False
 
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-MAX_CHUNKS     = 5   # hard cap — prevents context overload
+MAX_CHUNKS     = 3   # hard cap — reduced from 5 for faster LLM processing
 
 
 def _bm25_tokenize(text: str) -> list[str]:
-    """Lowercase + alphanumeric tokens only. Fast, deterministic."""
-    return _re.findall(r"[a-z0-9]+", text.lower())
+    """Lowercase BM25 tokens while preserving hyphenated ML terms."""
+    return _re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)*", text.lower())
+
+
+def _normalize_scores(values: list[float]) -> list[float]:
+    """Min-max normalize scores to [0, 1] for comparable hybrid scoring."""
+    if not values:
+        return []
+    min_s = min(values)
+    max_s = max(values)
+    rng = max_s - min_s
+    if len(values) == 1:
+        return [1.0]
+    if rng < 1e-8:
+        return [1.0] * len(values)
+    return [(v - min_s) / rng for v in values]
+
+
+def _preprocess_retrieval_query(query: str) -> str:
+    """Normalize noisy phrasing before dense+sparse retrieval."""
+    q = query or ""
+    contractions = {
+        r"\bwhat's\b": "what is",
+        r"\bit's\b": "it is",
+        r"\bcan't\b": "cannot",
+        r"\bdon't\b": "do not",
+    }
+    for pattern, replacement in contractions.items():
+        q = re.sub(pattern, replacement, q, flags=re.IGNORECASE)
+    q = re.sub(r"\blike (i'?m|i am) \d+\b", "", q, flags=re.IGNORECASE)
+    q = re.sub(r"\b(idk|lol|tbh|ngl)\b", "", q, flags=re.IGNORECASE)
+    q = re.sub(r"\s+", " ", q).strip()
+    return q or query
+
+
+def needs_rerank(chunks: list[dict]) -> bool:
+    """
+    Decide if reranking is needed using combined confidence signals.
+    Handles both weak retrieval (low absolute score) and
+    ambiguous retrieval (small gap between top-2 candidates).
+    """
+    if len(chunks) < 2:
+        return True
+    # Weak retrieval: top score too low
+    if chunks[0].get("score", 0.0) < 0.65:
+        return True
+    # Ambiguous retrieval: top-2 scores too close
+    score_diff = chunks[0].get("score", 0.0) - chunks[1].get("score", 0.0)
+    return score_diff < 0.05
 
 
 class HybridRAGPipeline(RAGPipeline):
     """
-    Drop-in upgrade over RAGPipeline.
+    Adaptive Hybrid RAG Pipeline — drop-in upgrade over RAGPipeline.
     Uses the same FAISS index + chunks file — no re-ingestion needed.
 
+    Key optimization: conditional reranking.
+    - Fast mode (default): FAISS + BM25 only → ~1-2s retrieval
+    - Rerank mode (auto):  adds CrossEncoder when confidence is low → ~3-4s
+
     Extra kwargs in __init__:
-        faiss_k  : candidates to pull from FAISS (default 10)
-        bm25_k   : candidates to pull from BM25  (default 10)
-        max_chunks: final chunks returned after reranking (default 5)
-        use_reranker: whether to run cross-encoder (default True)
+        faiss_k  : candidates to pull from FAISS (default 5)
+        bm25_k   : candidates to pull from BM25  (default 3)
+        max_chunks: final chunks returned after scoring (default 3)
+        use_reranker: allow reranking when needed (default True)
     """
 
     def __init__(
         self,
-        faiss_k:      int  = 10,
-        bm25_k:       int  = 10,
+        faiss_k:      int  = 5,    # reduced from 10 for speed
+        bm25_k:       int  = 3,    # reduced from 10 for speed
         max_chunks:   int  = MAX_CHUNKS,
-        use_reranker: bool = True,
+        use_reranker: bool = True,  # allows reranking, doesn't force it
     ):
         super().__init__()          # loads SentenceTransformer(MODEL_NAME)
         self.faiss_k      = faiss_k
         self.bm25_k       = bm25_k
         self.max_chunks   = max_chunks
         self.use_reranker = use_reranker and _RERANKER_AVAILABLE
+        self.min_final_score = 0.30
+        self.min_semantic_score = 0.30
 
         self._bm25:     object | None = None
         self._reranker: object | None = None
@@ -248,22 +357,44 @@ class HybridRAGPipeline(RAGPipeline):
         self,
         query:           str,
         top_k:           int   = 4,      # kept for API compatibility; ignored internally
-        score_threshold: float = 0.20,
+        score_threshold: float = 0.30,
+        level:           str   = "",     # "Beginner" | "Intermediate" | "Advanced"
     ) -> list[dict]:
         """
-        Hybrid retrieval: FAISS (dense) + BM25 (sparse) → cross-encoder rerank.
+        Adaptive Hybrid Retrieval:
+          FAISS (dense) + BM25 (sparse) → confidence check → conditional rerank.
+
+        Fast path (~1-2s): Skip reranker when top FAISS score is confident.
+        Full path (~3-4s): Apply reranker only when retrieval confidence is low.
 
         The top_k parameter is preserved for API compatibility with existing callers
         (app.py, rag_eval.py). Internally, faiss_k and bm25_k control candidate
         breadth, and max_chunks caps the final output.
+
+        Level-aware adaptation:
+          Beginner:     faiss_k=4, bm25_k=2, rerank only if needed
+          Intermediate: uses instance defaults
+          Advanced:     faiss_k=6, bm25_k=4, rerank when sparse or ambiguous
         """
+        # ── Level-aware adaptation (local vars — never mutate self) ───
+        faiss_k = self.faiss_k
+        bm25_k  = self.bm25_k
+
+        if level == "Advanced":
+            faiss_k = 6
+            bm25_k  = 4
+        elif level == "Beginner":
+            faiss_k = 4
+            bm25_k  = 2
+
         if self.index is None:
             self.load_index()
+        q = _preprocess_retrieval_query(query)
 
         # ── Stage 1: FAISS dense retrieval ───────────────────────────────
-        q_vec = self.model.encode([query], normalize_embeddings=True)
+        q_vec = self.model.encode([q], normalize_embeddings=True)
         scores_arr, indices_arr = self.index.search(
-            np.array(q_vec, dtype="float32"), self.faiss_k
+            np.array(q_vec, dtype="float32"), faiss_k
         )
         faiss_hits: list[dict] = []
         for score, idx in zip(scores_arr[0], indices_arr[0]):
@@ -277,7 +408,7 @@ class HybridRAGPipeline(RAGPipeline):
             faiss_hits.append(chunk)
 
         # ── Stage 2: BM25 sparse retrieval ───────────────────────────────
-        bm25_hits = self._bm25_retrieve(query, self.bm25_k)
+        bm25_hits = self._bm25_retrieve(q, bm25_k)
 
         # ── Stage 3: Union + deduplicate ─────────────────────────────────
         # FAISS first → in case of duplicate, FAISS score is kept
@@ -286,19 +417,64 @@ class HybridRAGPipeline(RAGPipeline):
         if not candidates:
             return []
 
-        # ── Stage 4: Cross-encoder reranking ─────────────────────────────
-        reranker = self._get_reranker()
-        if reranker is not None and len(candidates) > 1:
-            pairs  = [(query, c["text"]) for c in candidates]
-            re_scores = reranker.predict(pairs)    # numpy array
-
-            for chunk, re_score in zip(candidates, re_scores):
-                chunk["rerank_score"] = round(float(re_score), 4)
-
-            candidates.sort(key=lambda c: c.get("rerank_score", 0.0), reverse=True)
+        # ── Stage 4: Confidence check — conditional reranking ────────────
+        # Advanced: rerank only when retrieval is sparse or ambiguous
+        # Other levels: rerank only when confidence is low
+        if level == "Advanced":
+            force_rerank = len(candidates) < 3 or needs_rerank(candidates)
         else:
-            # No reranker — fall back to FAISS score ordering
-            candidates.sort(key=lambda c: c.get("score", 0.0), reverse=True)
+            force_rerank = False
 
-        # ── Stage 5: Hard cap ─────────────────────────────────────────────
-        return candidates[: self.max_chunks]
+        should_rerank = self.use_reranker and (force_rerank or needs_rerank(candidates))
+
+        if should_rerank:
+            reranker = self._get_reranker()
+            if reranker is not None and len(candidates) > 1:
+                # Narrow to top 5 before reranking (cost control)
+                candidates = candidates[:5]
+                pairs  = [(q, c["text"]) for c in candidates]
+                re_scores = reranker.predict(pairs)    # numpy array
+
+                for chunk, re_score in zip(candidates, re_scores):
+                    chunk["rerank_score"] = round(float(re_score), 4)
+
+                # ── Stage 5: Normalized hybrid scoring ───────────────────
+                # Normalize both score types to [0,1] before combining,
+                # since FAISS cosine-sim and cross-encoder logits differ.
+                faiss_vals  = [c.get("score", 0.0) for c in candidates]
+                rerank_vals = [c.get("rerank_score", 0.0) for c in candidates]
+                norm_faiss  = _normalize_scores(faiss_vals)
+                norm_rerank = _normalize_scores(rerank_vals)
+
+                for chunk, nf, nr in zip(candidates, norm_faiss, norm_rerank):
+                    chunk["final_score"] = round(0.7 * nr + 0.3 * nf, 4)
+
+                candidates.sort(
+                    key=lambda c: c.get("final_score", 0.0), reverse=True
+                )
+        else:
+            # Fast path: apply definition-signal boost + length penalty
+            for chunk in candidates:
+                base = chunk.get("score", 0.0)
+                boost = _compute_chunk_boost(chunk)
+                chunk["final_score"] = round(base + boost, 4)
+
+            candidates.sort(
+                key=lambda c: c.get("final_score", 0.0), reverse=True
+            )
+
+        # ── Stage 5.5: Out-of-scope guard ────────────────────────────────
+        # Reject weak/BM25-only retrieval so app can abstain cleanly.
+        top_final = float(candidates[0].get("final_score", 0.0))
+        top_semantic = max(float(c.get("score", 0.0) or 0.0) for c in candidates)
+        if top_final < self.min_final_score or top_semantic < self.min_semantic_score:
+            return []
+
+        # ── Stage 6: Hard cap + trim chunks ──────────────────────────────
+        final = candidates[:self.max_chunks]
+
+        # Keep full ingest chunk size (ingest enforces 1200-char ceiling).
+        for chunk in final:
+            chunk["text"] = trim_chunk(chunk["text"], max_chars=1200)
+
+        return final

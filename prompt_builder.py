@@ -21,12 +21,12 @@ import textwrap
 
 SYSTEM_TEMPLATE = """You are a precise, expert machine learning tutor.
 
-═══ ABSOLUTE RULES ═══
-1. Use ONLY the provided context. Never use outside knowledge.
-2. Never guess. Never fill gaps. Never invent equations or facts.
-3. If context is missing or partial, say so explicitly.
-4. Every claim must be traceable to a chunk in the context.
-5. No preamble ("Great question!", "Sure!"). No sign-off.
+═══ RULES ═══
+1. Primarily use the provided context to answer. If the context does not cover the question, state that clearly. Do not generate facts not present in the context.
+2. Never invent citations or technical claims not supported by context. For Advanced level, use equations only when they are grounded in the retrieved context.
+3. No preamble ("Great question!", "Sure!"). No sign-off.
+4. Prefer accuracy over verbosity.
+5. If the question is not about machine learning or data science, respond only with: "This question is outside the scope of this ML tutor." Do not attempt to answer it.
 
 ═══ USER PROFILE ═══
 Level : {level}
@@ -36,65 +36,41 @@ Style : {style}
 {style_instruction}
 
 ═══ REQUIRED OUTPUT FORMAT — FOLLOW EXACTLY ═══
-Produce ALL six sections below. Do not skip any. Do not add extras.
+Produce exactly the sections listed below. Do not skip required sections. Do not add extras.
 
-**📖 Definition**
-(1–2 sentences. Precise, textbook-quality definition of the concept.)
-
-**💡 Intuition**
-(2–3 sentences. Simple, beginner-friendly analogy or mental model.
- No equations. Explain WHY it exists / what problem it solves.)
-
-**⚙️ How it Works**
-1. (Step one — numbered list, 3–5 steps)
-2. (Step two)
-3. (Step three)
-(Add steps 4–5 only for Detailed style or Advanced level.)
-
-**🔑 Key Points**
-- (Bullet 1 — short and precise)
-- (Bullet 2)
-- (Bullet 3)
-{extra_bullets}
-
-**🧪 Example**
-(1 concrete, simple example. For Beginner: everyday analogy.
- For Intermediate/Advanced: a brief numerical or code example if context supports it.)
-
-**⚠️ Common Mistakes**
-- (Mistake 1)
-- (Mistake 2)
-(Add a 3rd mistake for Detailed style.)
+{format_instructions}
 
 **📄 Sources**
 - See [source filename], p.[page]
 
-═══ FALLBACK RULES ═══
-If NO relevant context:
-  Respond ONLY with: "I don't have enough information in the provided context to answer this."
-
-If PARTIAL context:
-  Fill what you can, then end with:
-  "Note: the context does not fully cover this topic."
+═══ FALLBACK ═══
+If context is very thin, explicitly state that the textbook context is insufficient for the question.
 """
 
 # ── Per-level and per-style instructions ─────────────────────────────
 
 _LEVEL_NOTES = {
     "Beginner": (
-        "Level instruction: Use plain, everyday language. "
-        "Avoid jargon. Lead with a real-world analogy before any technical detail. "
-        "Skip heavy math even if it appears in context."
+        "Level instruction: Use plain, everyday language a high school student could follow. "
+        "Avoid jargon entirely — if you must use a technical term, define it immediately. "
+        "Lead with a real-world analogy (e.g., cooking, sports, daily life) before any technical detail. "
+        "Skip ALL math, equations, and formulas even if they appear in context. "
+        "Use phrases like 'Think of it like…' or 'Imagine…' to build understanding."
     ),
     "Intermediate": (
         "Level instruction: Balance intuition and technical precision. "
-        "Include key formulas if they appear verbatim in the context. "
-        "Briefly explain what each formula means."
+        "Include key formulas if they appear in the context and briefly explain each variable. "
+        "Use moderate technical vocabulary but still explain non-obvious terms. "
+        "Provide a concrete numerical example when possible."
     ),
     "Advanced": (
-        "Level instruction: Use full technical depth. "
-        "Include equations, derivations, and assumptions exactly as in context. "
-        "No hand-holding — assume strong ML background."
+        "Level instruction: Use full technical depth and precise terminology. "
+        "Use equations only when they are supported by the retrieved context; do not introduce outside formulas. "
+        "Use correct mathematical notation (e.g., theta := theta - alpha * dJ/d_theta). "
+        "If generating equations, ensure notation is accurate and consistent with the context. "
+        "Include derivations, mathematical assumptions, and algorithmic complexities from context. "
+        "Reference specific edge cases and failure modes. "
+        "No hand-holding — assume strong ML/math background."
     ),
 }
 
@@ -113,14 +89,33 @@ _STYLE_NOTES = {
     ),
 }
 
-_EXTRA_BULLETS = {
-    "Quick":    "",                          # 3 bullets only
-    "Detailed": "- (Bullet 4)\n- (Bullet 5)",
-}
+def _build_format_instructions(style: str, level: str) -> str:
+    """
+    Adaptive output structure:
+    Always: Definition, How it Works, Key Points.
+    Detailed only: Intuition, Example, Common Mistakes.
+    """
+    _ = level
+    sections = [
+        "**📖 Definition**\n(1–2 sentences. Precise, textbook-quality definition of the concept.)",
+        "**⚙️ How it Works**\n1. (Step one — numbered list, 3–5 steps)\n2. (Step two)\n3. (Step three)",
+        "**🔑 Key Points**\n- (Bullet 1 — short and precise)\n- (Bullet 2)\n- (Bullet 3)",
+    ]
+    if style == "Detailed":
+        sections.extend([
+            "**💡 Intuition**\n(2–3 sentences. Simple mental model. Explain WHY it exists / what problem it solves.)",
+            "**🧪 Example**\n(1 concrete example. Beginner: analogy. Intermediate/Advanced: numerical or code example if context supports it.)",
+            "**⚠️ Common Mistakes**\n- (Mistake 1)\n- (Mistake 2)\n- (Mistake 3)",
+        ])
+    sections.append("**📄 Sources**\n- See [source filename], p.[page]")
+    return "\n\n".join(sections)
 
 
 USER_TEMPLATE = """Context:
 {context}
+
+Recent conversation (most recent last):
+{conversation}
 
 Question:
 {question}
@@ -136,6 +131,7 @@ def build_messages(
     chunks:   list,
     level:    str = "Intermediate",
     style:    str = "Detailed",
+    chat_history: list[dict] | None = None,
 ) -> list[dict]:
     """
     Returns [system_msg, user_msg] dicts.
@@ -153,7 +149,7 @@ def build_messages(
         style=style,
         level_instruction=_LEVEL_NOTES[level],
         style_instruction=_STYLE_NOTES[style],
-        extra_bullets=_EXTRA_BULLETS[style],
+        format_instructions=_build_format_instructions(style, level),
     )
 
     if chunks:
@@ -169,11 +165,21 @@ def build_messages(
     else:
         context_block = "No relevant context was retrieved."
 
+    chat_history = chat_history or []
+    last_turns = chat_history[-4:]
+    convo_lines: list[str] = []
+    for turn in last_turns:
+        role = "User" if turn.get("role") == "user" else "Assistant"
+        text = re.sub(r"\s+", " ", str(turn.get("content", "")).strip())
+        if text:
+            convo_lines.append(f"{role}: {text}")
+    conversation_block = "\n".join(convo_lines) if convo_lines else "None"
+
     return [
         {"role": "system", "content": system_content},
         {"role": "user",
          "content": USER_TEMPLATE.format(
-             context=context_block, question=question
+             context=context_block, conversation=conversation_block, question=question
          )},
     ]
 
@@ -203,137 +209,249 @@ def llm_response_is_adequate(text: str) -> bool:
     return not any(p in text.lower() for p in phrases)
 
 
-def response_seems_truncated(text: str) -> bool:
+def response_seems_truncated(text: str, style: str = "Detailed") -> bool:
     """
-    Heuristic: response is likely cut off if it's missing ≥ 3 of the 6
-    expected section headers, OR ends mid-sentence without punctuation.
+    Heuristic: response is likely cut off if it's missing required section
+    headers for the style, OR ends mid-sentence without punctuation.
     """
-    expected_headers = [
-        "📖 Definition", "💡 Intuition", "⚙️ How it Works",
-        "🔑 Key Points", "🧪 Example", "⚠️ Common Mistakes",
-    ]
+    expected_headers = ["📖 Definition", "⚙️ How it Works", "🔑 Key Points"]
+    if style == "Detailed":
+        expected_headers.extend(["💡 Intuition", "🧪 Example", "⚠️ Common Mistakes"])
     missing = sum(1 for h in expected_headers if h not in text)
     ends_abruptly = text.strip() and text.strip()[-1] not in ".!?\"'"
-    return missing >= 3 or (missing >= 1 and ends_abruptly)
+    return missing >= max(1, len(expected_headers) // 2) or (missing >= 1 and ends_abruptly)
 
 
 # ══════════════════════════════════════════════════════════════════════
 #  STRUCTURED FALLBACK  (no LLM required)
-#  Called when API is unavailable. Converts raw chunk text into the
-#  6-section format using heuristic text analysis.
+#  Synthesizes a clean 6-section answer from chunk text.
+#  Key improvement: COMBINES and REWRITES instead of filtering sentences.
 # ══════════════════════════════════════════════════════════════════════
 
-def make_structured_fallback(chunks: list, question: str) -> str:
+def _clean_sentence(s: str) -> str:
     """
-    Build a clean 6-section answer from retrieved chunks WITHOUT any LLM.
-    Never dumps raw text. Always produces readable, structured output.
+    Clean sentence safely:
+    - normalize whitespace
+    - avoid punctuation rewrites when code/math/decimals are present
+    """
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return s
+    looks_like_code = any(tok in s for tok in ("`", "==", "!=", "->", "::", "()", "[]", "{}"))
+    has_decimal = bool(re.search(r"\d+\.\d+", s))
+    has_mathish = any(op in s for op in ("=", "+", "-", "*", "/", "^", "∂", "θ", "α", "β"))
+    if not (looks_like_code or has_decimal or has_mathish):
+        if s[-1] not in ".!?":
+            s += "."
+    return s
 
-    Strategy:
-      Definition    ← best sentence containing "is", "defined as", "refers to"
-      Intuition     ← 2 sentences that follow the definition or use plain language
-      How it Works  ← remaining sentences split into numbered steps (max 4)
-      Key Points    ← signal-word sentences from all chunks (deduplicated)
-      Example       ← any sentence containing "example", "e.g.", "for instance"
-      Common Mistakes ← warning-style sentences; generic fallback if none found
-      Sources       ← from chunk metadata
+
+def _smooth_section(text: str, max_sentences: int = 2) -> str:
+    """
+    Light rewrite pass: deduplicate sentences, cap length, ensure flow.
+    Turns 'assembled text' into 'readable explanation'.
+    """
+    raw = re.split(r'(?<=[.!?])\s+', text.strip())
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for s in raw:
+        s = s.strip()
+        if not s or len(s) < 15:
+            continue
+        key = s[:50].lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(s)
+    return " ".join(cleaned[:max_sentences])
+
+
+def _extract_clean_sentences(text: str) -> list[str]:
+    """Extract well-formed sentences from combined chunk text."""
+    text = re.sub(r'\s+', ' ', text).strip()
+    raw = re.split(r'(?<=[.!?])\s+', text)
+    seen: set[str] = set()
+    clean: list[str] = []
+    for s in raw:
+        s = _clean_sentence(s)
+        if len(s) < 25:
+            continue
+        # Skip fragments: low alpha ratio or too few words
+        alpha = sum(c.isalpha() for c in s) / max(len(s), 1)
+        if alpha < 0.5 or s.count(' ') < 3:
+            continue
+        # Deduplicate by first 60 chars
+        key = s[:60].lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        clean.append(s)
+    return clean
+
+
+def _extract_definition(sents: list[str], question: str) -> str:
+    """Find the best definitional sentence from the text."""
+    signals = [" is ", " is a ", " is an ", " are ", "defined as",
+               "refers to", "can be defined", "we define", "known as"]
+    # Prefer sentences that match question keywords
+    q_words = set(question.lower().split())
+    best = None
+    best_score = -1
+    for s in sents:
+        sl = s.lower()
+        has_signal = any(sig in sl for sig in signals)
+        keyword_overlap = sum(1 for w in q_words if w in sl and len(w) > 2)
+        score = (2 if has_signal else 0) + keyword_overlap
+        if score > best_score:
+            best_score = score
+            best = s
+    if best and len(best) > 200:
+        best = best[:200].rsplit(" ", 1)[0] + "."
+    return best or sents[0] if sents else "Definition not found in available context."
+
+
+def _simplify_for_intuition(sents: list[str], used: set[str]) -> str:
+    """Build an intuition paragraph from unused sentences."""
+    candidates = [s for s in sents if s not in used][:3]
+    if not candidates:
+        return "This concept helps solve a fundamental problem in machine learning by providing a systematic approach to improve model performance."
+    # Take the 2 shortest candidates (simpler language)
+    candidates.sort(key=len)
+    picked = candidates[:2]
+    return " ".join(picked)
+
+
+def _extract_steps(sents: list[str], used: set[str]) -> str:
+    """Extract procedural sentences as numbered steps."""
+    step_signals = ["first", "then", "next", "step", "start", "compute",
+                    "calculate", "update", "repeat", "iterate", "apply",
+                    "initialize", "select", "choose"]
+    steps = [s for s in sents if s not in used
+             and any(w in s.lower() for w in step_signals)][:4]
+    if not steps:
+        steps = [s for s in sents if s not in used and len(s) > 30][:3]
+    if steps:
+        return "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps))
+    return "1. Refer to the source reference below for detailed steps."
+
+
+def _extract_key_points(sents: list[str], used: set[str]) -> str:
+    """Extract key insight sentences as bullet points."""
+    kp_signals = {"key", "important", "note", "must", "always", "never",
+                  "typically", "generally", "crucial", "fundamental", "essential"}
+    points = [s for s in sents
+              if any(w in s.lower() for w in kp_signals) and s not in used][:3]
+    if not points:
+        points = [s for s in sents if s not in used][:3]
+    if points:
+        return "\n".join(f"- {s[:120]}{'...' if len(s) > 120 else ''}"
+                         for s in points)
+    return "- See source reference for detailed key points."
+
+
+def _find_example(sents: list[str], used: set[str], question: str) -> str:
+    """Find an example sentence or generate a topic-aware fallback."""
+    ex_signals = ["example", "e.g.", "for instance", "such as",
+                  "consider", "suppose", "imagine"]
+    ex = [s for s in sents
+          if any(w in s.lower() for w in ex_signals) and s not in used]
+    if ex:
+        return ex[0]
+    # Topic-aware fallback examples
+    q = question.lower()
+    if "gradient" in q or "descent" in q:
+        return "Consider minimizing f(x) = x^2. Starting at x=4 with learning rate 0.1: x_new = 4 - 0.1*8 = 3.2. Each step moves closer to the minimum at x=0."
+    if "backprop" in q:
+        return "In a 2-layer network, the error at the output propagates backward: each weight's gradient is computed using the chain rule, layer by layer."
+    if "svm" in q or "support vector" in q:
+        return "Given two classes of points in 2D, SVM finds the line (hyperplane) that maximizes the margin between the closest points of each class."
+    if "knn" in q or "nearest neighbor" in q:
+        return "To classify a new point, KNN finds the k closest training points and assigns the majority class. With k=3, if 2 neighbors are 'cat' and 1 is 'dog', the prediction is 'cat'."
+    if "overfit" in q or "regulariz" in q:
+        return "A model that memorizes 100% of training data but scores 60% on test data is overfitting. Adding L2 regularization penalizes large weights and improves generalization."
+    if "decision tree" in q or "random forest" in q:
+        return "A decision tree splits data by asking yes/no questions. For predicting loan approval: first split on income > 50k, then on credit score > 700."
+    return "For a worked example, refer to the source textbook at the page listed below."
+
+
+def _find_mistakes(sents: list[str], used: set[str], question: str) -> str:
+    """Extract warning sentences or generate topic-aware common mistakes."""
+    warn_signals = ["mistake", "error", "avoid", "pitfall", "wrong",
+                    "incorrect", "careful", "beware", "issue", "problem"]
+    warns = [s for s in sents
+             if any(w in s.lower() for w in warn_signals) and s not in used][:2]
+    if warns:
+        return "\n".join(f"- {s[:120]}{'...' if len(s) > 120 else ''}"
+                         for s in warns)
+    q = question.lower()
+    if "gradient" in q or "descent" in q or "learning rate" in q:
+        return ("- Setting the learning rate too high causes divergence; too low causes slow convergence.\n"
+                "- Not normalizing input features leads to uneven gradient updates.")
+    if "overfit" in q or "regulariz" in q or "dropout" in q:
+        return ("- Tuning regularization on the test set leads to data leakage.\n"
+                "- Applying too much regularization causes underfitting.")
+    if "backprop" in q:
+        return ("- Vanishing gradients in deep networks prevent early layers from learning.\n"
+                "- Not initializing weights properly can cause training to stall.")
+    if "svm" in q:
+        return ("- Using a linear kernel on non-linearly separable data gives poor results.\n"
+                "- Not scaling features before SVM training biases the decision boundary.")
+    return ("- Always validate on held-out data to detect overfitting.\n"
+            "- Ensure data is preprocessed consistently between train and test sets.")
+
+
+def make_structured_fallback(chunks: list, question: str, style: str = "Detailed") -> str:
+    """
+    Build a clean structured answer from retrieved chunks WITHOUT any LLM.
+
+    Key improvement: SYNTHESIZES instead of filtering.
+    - Combines all chunk text into one corpus
+    - Deduplicates sentences
+    - Cleans broken fragments
+    - Rewrites into coherent structured sections
+    - Uses topic-aware fallbacks for examples/mistakes
     """
     if not chunks:
-        return (
-            "**📖 Definition**\nNo relevant content found in the textbooks.\n\n"
-            "**💡 Intuition**\nTry rephrasing your question or use a more specific term.\n\n"
-            "**⚙️ How it Works**\n1. Check that the relevant PDF is in `data/`.\n"
+        base = (
+            "**\U0001f4d6 Definition**\nNo relevant content found in the textbooks.\n\n"
+            "**\u2699\ufe0f How it Works**\n1. Check that the relevant PDF is in `data/`.\n"
             "2. Rebuild the index: `python ingest.py --dir data`.\n\n"
-            "**🔑 Key Points**\n- No textbook passage matched this query.\n\n"
-            "**🧪 Example**\nNot available.\n\n"
-            "**⚠️ Common Mistakes**\n- Make sure your PDFs cover this topic.\n\n"
-            "**📄 Sources**\n- No sources available."
+            "**\U0001f511 Key Points**\n- No textbook passage matched this query.\n"
         )
-
-    # ── Gather + clean sentences from top 3 chunks ────────────────────
-    all_text  = " ".join(c.get("text", "") for c in chunks[:3])
-    raw_sents = re.split(r'(?<=[.!?])\s+', all_text)
-    sents     = [s.strip() for s in raw_sents if len(s.strip()) > 25]
-
-    # ── Definition: best definitional sentence ────────────────────────
-    _def_signals = [" is ", " is a ", " is an ", " are ", "defined as",
-                    "refers to", "can be defined", "we define", "known as"]
-    def_sent = next(
-        (s for s in sents if any(sig in s.lower() for sig in _def_signals)),
-        sents[0] if sents else "Definition not found in available context."
-    )
-    # Keep definition concise — cap at 200 chars
-    if len(def_sent) > 200:
-        def_sent = def_sent[:200].rsplit(" ", 1)[0] + "…"
-
-    used: set = {def_sent}
-
-    # ── Intuition: next 2 sentences not already used ──────────────────
-    intuition_sents = [s for s in sents if s not in used][:2]
-    intuition = " ".join(intuition_sents) if intuition_sents else (
-        "Think of it as an iterative process that improves a solution step by step."
-    )
-    used.update(intuition_sents)
-
-    # ── How it Works: remaining → numbered steps ──────────────────────
-    step_sents = [s for s in sents if s not in used and len(s) > 30][:4]
-    if step_sents:
-        steps = "\n".join(f"{i+1}. {s}" for i, s in enumerate(step_sents))
-    else:
-        steps = "1. Refer to the source reference below for a detailed step-by-step explanation."
-
-    # ── Key Points: signal-word sentences, deduplicated ───────────────
-    kp_signals = {"key", "important", "note", "must", "always", "never",
-                  "typically", "generally", "commonly", "often", "crucial",
-                  "main", "primary", "fundamental", "essential"}
-    kp_sents = [s for s in sents
-                if any(w in s.lower() for w in kp_signals) and s not in used][:3]
-    if not kp_sents:
-        kp_sents = [s for s in sents if s not in used][:3]
-    bullets = "\n".join(
-        f"- {s[:110]}{'…' if len(s) > 110 else ''}" for s in kp_sents
-    ) or "- See source reference for detailed key points."
-
-    # ── Example: first example-style sentence ─────────────────────────
-    ex_signals = ["example", "e.g.", "for instance", "such as",
-                  "consider", "suppose", "imagine", "think of"]
-    ex_sents = [s for s in sents
-                if any(w in s.lower() for w in ex_signals) and s not in used]
-    example = ex_sents[0] if ex_sents else (
-        "For a worked example, refer to the source textbook at the page listed below."
-    )
-
-    # ── Common Mistakes: warning-style sentences ──────────────────────
-    warn_signals = ["mistake", "error", "avoid", "pitfall", "common",
-                    "wrong", "incorrect", "not ", "don't", "cannot",
-                    "careful", "beware", "issue", "problem"]
-    warn_sents = [s for s in sents
-                  if any(w in s.lower() for w in warn_signals) and s not in used][:2]
-    if warn_sents:
-        mistakes = "\n".join(
-            f"- {s[:110]}{'…' if len(s) > 110 else ''}" for s in warn_sents
-        )
-    else:
-        # Topic-aware generic fallbacks
-        q_lower = question.lower()
-        if any(w in q_lower for w in ["gradient", "descent", "learning rate"]):
-            mistakes = (
-                "- Setting the learning rate too high causes divergence; too low causes slow convergence.\n"
-                "- Not normalizing input features leads to uneven gradient updates."
+        if style == "Detailed":
+            base += (
+                "\n**\U0001f4a1 Intuition**\nTry rephrasing your question or use a more specific term.\n\n"
+                "**\U0001f9ea Example**\nNot available.\n\n"
+                "**\u26a0\ufe0f Common Mistakes**\n- Make sure your PDFs cover this topic.\n"
             )
-        elif any(w in q_lower for w in ["overfit", "regulariz", "dropout"]):
-            mistakes = (
-                "- Tuning regularization on the test set leads to data leakage.\n"
-                "- Applying too much regularization causes underfitting."
-            )
-        else:
-            mistakes = (
-                "- Always validate on held-out data to detect overfitting.\n"
-                "- Ensure data is preprocessed consistently between train and test sets."
-            )
+        return base + "\n\n**\U0001f4c4 Sources**\n- No sources available."
+
+    # ── Combine all chunk text into one corpus ────────────────────────
+    combined = " ".join(c.get("text", "") for c in chunks[:3])
+    sents = _extract_clean_sentences(combined)
+
+    # ── Build each section by synthesis ───────────────────────────────
+    definition = _extract_definition(sents, question)
+    used: set[str] = {definition}
+
+    intuition = _simplify_for_intuition(sents, used)
+    used.update(intuition.split(". "))
+
+    steps = _extract_steps(sents, used)
+    used.update(s.lstrip("0123456789. ") for s in steps.split("\n"))
+
+    key_points = _extract_key_points(sents, used)
+    example = _find_example(sents, used, question)
+    mistakes = _find_mistakes(sents, used, question)
+
+    # ── Smooth rewrite pass — remove repetition, cap length ──────────
+    definition = _smooth_section(definition, max_sentences=2)
+    intuition  = _smooth_section(intuition, max_sentences=2)
+    example    = _smooth_section(example, max_sentences=3)
 
     # ── Sources ───────────────────────────────────────────────────────
     seen_src: set = set()
-    source_lines  = []
+    source_lines = []
     for c in chunks:
         key = (c.get("source", "?"), c.get("page", "?"))
         if key not in seen_src:
@@ -341,16 +459,22 @@ def make_structured_fallback(chunks: list, question: str) -> str:
             source_lines.append(f"- See {key[0]}, p.{key[1]}")
     sources = "\n".join(source_lines) or "- Source metadata unavailable."
 
-    return (
-        f"**📖 Definition**\n{def_sent}\n\n"
-        f"**💡 Intuition**\n{intuition}\n\n"
-        f"**⚙️ How it Works**\n{steps}\n\n"
-        f"**🔑 Key Points**\n{bullets}\n\n"
-        f"**🧪 Example**\n{example}\n\n"
-        f"**⚠️ Common Mistakes**\n{mistakes}\n\n"
-        f"**📄 Sources**\n{sources}\n\n"
-        f"*Note: Generated from textbook passages directly (Gemini unavailable).*"
+    body = (
+        f"**\U0001f4d6 Definition**\n{definition}\n\n"
+        f"**\u2699\ufe0f How it Works**\n{steps}\n\n"
+        f"**\U0001f511 Key Points**\n{key_points}\n"
     )
+    if style == "Detailed":
+        body += (
+            f"\n**\U0001f4a1 Intuition**\n{intuition}\n\n"
+            f"**\U0001f9ea Example**\n{example}\n\n"
+            f"**\u26a0\ufe0f Common Mistakes**\n{mistakes}\n"
+        )
+    body += (
+        f"\n\n**\U0001f4c4 Sources**\n{sources}\n\n"
+        f"*Note: Generated from textbook passages directly (LLM unavailable).*"
+    )
+    return body
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -725,6 +849,18 @@ EXPLORE_PLAYLISTS = [
 #  MATCHING LOGIC
 # ══════════════════════════════════════════════════════════════════════
 
+def _fallback_video_message(query: str) -> list[dict] | None:
+    """
+    Graceful fallback when no video is found.
+    Returns a single "no match" item instead of empty list.
+    """
+    return [{
+        "title": f"No specific video matched '{query}'.",
+        "channel": "Recommendation System",
+        "url": None,
+        "is_fallback": True,
+    }]
+
 def _tokenize(text: str) -> set[str]:
     """Lowercase + strip punctuation (keep hyphens). Returns unigrams + bigrams."""
     clean = re.sub(r"[^\w\s-]", " ", text.lower())
@@ -745,25 +881,84 @@ def _score_topic(query_tokens: set[str], keywords: list[str]) -> tuple[int, bool
     return len(hits), has_phrase
 
 
+# Synonym map for broader topic detection coverage
+_TOPIC_SYNONYMS: dict[str, list[str]] = {
+    "backpropagation":       ["backprop", "back propagation", "neural gradient", "error backpropagation"],
+    "gradient_descent":      ["gradient descent", "gd algorithm", "optimization step", "steepest descent"],
+    "neural_networks":       ["neural network", "neural net", "deep learning", "mlp", "perceptron"],
+    "svm":                   ["svm", "support vector", "max margin", "kernel trick"],
+    "knn":                   ["knn", "k-nearest", "nearest neighbor", "k nearest"],
+    "trees":                 ["decision tree", "random forest", "ensemble", "boosting", "xgboost"],
+    "transformers":          ["transformer", "attention mechanism", "self-attention", "bert", "gpt"],
+    "regularization":        ["regulariz", "overfitting", "dropout", "weight decay", "l1 l2"],
+    "clustering":            ["clustering", "k-means", "kmeans", "dbscan", "centroid"],
+    "reinforcement_learning":["reinforcement learning", "q-learning", "rl agent", "policy gradient"],
+    "supervised_unsupervised":["supervised vs unsupervised", "labeled vs unlabeled"],
+    "loss_functions":        ["loss function", "cross entropy", "cost function", "mse loss", "log loss"],
+    "bias_variance":         ["bias variance", "bias-variance", "underfitting overfitting"],
+    "training_process":      ["forward pass", "backward pass", "training loop", "training epoch", "activation function"],
+}
+
+
+def detect_topic(query: str) -> str | None:
+    """
+    Robust topic detection using synonym-based substring matching.
+    Uses _TOPIC_SYNONYMS for broad coverage of phrasing variants.
+    Returns the topic key or None.
+    """
+    q = query.lower()
+    # Check synonym lists — first match wins (ordered by specificity)
+    for topic, synonyms in _TOPIC_SYNONYMS.items():
+        if any(syn in q for syn in synonyms):
+            return topic
+    # Handle compound checks that need AND logic
+    if "supervised" in q and "unsupervised" in q:
+        return "supervised_unsupervised"
+    if "bias" in q and "variance" in q:
+        return "bias_variance"
+    if "training" in q and ("process" in q or "loop" in q or "epoch" in q):
+        return "training_process"
+    # Single-word fallbacks
+    if "gradient" in q:
+        return "gradient_descent"
+    return None
+
+
 def recommend_videos(query: str) -> list[dict]:
     """
-    Returns EXACTLY 2 videos for best-matched topic, or [] if no confident match.
-    Confidence: score ≥ 2 OR (score = 1 AND multi-word phrase hit).
+    Returns EXACTLY 2 videos for best-matched topic, or fallback message if no match.
+
+    Uses a two-tier approach:
+      1. detect_topic() — fast substring matching (catches most cases)
+      2. _score_topic() — keyword scoring fallback (handles edge cases)
+
+    Always returns videos if a topic is confidently detected.
+    Shows informative fallback instead of silently returning nothing.
     """
+    # Tier 1: Direct substring detection (most reliable)
+    topic = detect_topic(query)
+    if topic and topic in TOPIC_REGISTRY:
+        return TOPIC_REGISTRY[topic]
+
+    # Tier 2: Keyword scoring fallback
     query_tokens = _tokenize(query)
     best_topic:      str | None = None
     best_score:      int        = 0
 
-    for topic, keywords in TOPIC_KEYWORDS.items():
+    for topic_key, keywords in TOPIC_KEYWORDS.items():
         score, has_phrase = _score_topic(query_tokens, keywords)
         if score == 0:
             continue
         qualifies = (score >= 2) or has_phrase
         if qualifies and score > best_score:
             best_score = score
-            best_topic = topic
+            best_topic = topic_key
 
-    return TOPIC_REGISTRY[best_topic] if best_topic else []
+    if best_topic:
+        return TOPIC_REGISTRY[best_topic]
+    
+    # Fallback: return informative message instead of empty list
+    return _fallback_video_message(query)
 
 
 def recommend_practice_video(query: str) -> dict | None:

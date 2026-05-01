@@ -2,6 +2,8 @@
 # ENV & SECRETS
 # ----------------------------
 .env
+.env.*
+!.env.example
 .streamlit/secrets.toml
 
 # ----------------------------
@@ -9,6 +11,8 @@
 # ----------------------------
 venv/
 .venv/
+env/
+ENV/
 
 # ----------------------------
 # PYTHON CACHE
@@ -16,6 +20,8 @@ venv/
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+*.pycache
 
 # ----------------------------
 # DATA & MODELS (GENERATED)
@@ -24,12 +30,16 @@ faiss_index.bin
 chunks.pkl
 data/
 *.pdf
+*.pkl
+*.bin
+models/
 
 # ----------------------------
 # EVALUATION OUTPUTS
 # ----------------------------
 eval_results.json
 eval_summary.txt
+eval_results_*.json
 
 # ----------------------------
 # TEST FILES
@@ -40,14 +50,60 @@ test_*.py
 *_test.py
 gemini_test.py
 claude_test.py
+openai_test.py
+
+# ----------------------------
+# STREAMLIT
+# ----------------------------
+.streamlit/
+!.streamlit/config.toml
+
+# ----------------------------
+# JUPYTER (if used for exploration)
+# ----------------------------
+.ipynb_checkpoints/
+*.ipynb
 
 # ----------------------------
 # SYSTEM FILES
 # ----------------------------
 .DS_Store
 Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
 
 # ----------------------------
-# OPTIONAL
+# WINDOWS / ONEDRIVE
+# ----------------------------
+*.lnk
+~$*
+
+# ----------------------------
+# IDE
+# ----------------------------
+.vscode/
+.idea/
+*.suo
+*.user
+
+# ----------------------------
+# LOGS & TEMP
 # ----------------------------
 *.log
+*.tmp
+*.temp
+tmp/
+temp/
+
+# ----------------------------
+# BUILD / DIST
+# ----------------------------
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# ----------------------------
+# DOCS (local only)
+# ----------------------------
+DEPLOYMENT.md

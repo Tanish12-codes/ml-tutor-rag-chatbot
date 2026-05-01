@@ -1,8 +1,18 @@
-google-genai>=1.0.0
-streamlit>=1.35.0
+# ── Core RAG & Retrieval ─────────────────────────────────────────────
 faiss-cpu>=1.8.0
 sentence-transformers>=3.0.0
-scikit-learn>=1.4.0
 rank-bm25>=0.2.2
+pdfplumber>=0.11.0
+
+# ── ML / Numeric ─────────────────────────────────────────────────────
 numpy>=1.26.0
+scikit-learn>=1.4.0
+
+# ── LLM Providers (use whichever you need) ───────────────────────────
+google-genai>=1.0.0          # Gemini
+openai>=1.30.0               # GPT-4o / GPT-4o-mini
+anthropic>=0.28.0            # Claude
+
+# ── App & Config ─────────────────────────────────────────────────────
+streamlit>=1.35.0
 python-dotenv>=1.0.0

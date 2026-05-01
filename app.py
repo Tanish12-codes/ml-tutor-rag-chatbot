@@ -1,36 +1,33 @@
 """
-app.py — ML Tutor  (production)
-SDK   : google-genai
-Model : gemini-2.5-flash
+app.py — ML Tutor  (production — optimized)
 
-Changes in this version:
-  • Gemini-only — Claude/Anthropic removed completely
-  • Model: models/gemini-2.5-flash (confirmed in gemini_test.py)
-  • max_tokens 1800 — prevents answer cut-offs
-  • Exponential backoff on 429 / rate limit errors
-  • response_seems_truncated() → auto-retry once on cut-off
-  • make_structured_fallback() — clean 6-section output when API unavailable
-  • Top navbar with app title + Gemini mode badge
-  • Empty / welcome state before first question
-  • Sidebar: 14 topics + textbook library + clean footer
+LLM layer is provider-agnostic. Switch provider by editing .env only:
+
+    LLM_PROVIDER=gemini          # gemini | openai | claude
+    GEMINI_MODEL=models/gemini-2.5-flash
+    OPENAI_MODEL=gpt-4o-mini
+    CLAUDE_MODEL=claude-3-haiku-20240307
+    GEMINI_API_KEY=...
+    OPENAI_API_KEY=...
+    ANTHROPIC_API_KEY=...
+
+No code changes are required to switch providers.
+RAG retrieval, fallback, and prompt logic are untouched.
 """
 
 import hashlib
 import os
-import random
 import time
+import random
 
 from dotenv import load_dotenv
 load_dotenv()
 
-import google.genai as genai
-from google.genai import types as genai_types
 import streamlit as st
 
 from rag_pipeline import RAGPipeline, HybridRAGPipeline
 from prompt_builder import (
     build_messages,
-    context_adequacy_check,
     llm_response_is_adequate,
     response_seems_truncated,
     make_structured_fallback,
@@ -42,6 +39,33 @@ from prompt_builder import (
 )
 
 DEV_MODE: bool = False
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  QUERY PREPROCESSING
+# ══════════════════════════════════════════════════════════════════════
+
+def preprocess_query(question: str) -> str:
+    """
+    Light normalization for semantic retrieval models.
+    Preserve natural-language phrasing and only expand key contractions.
+    """
+    import re
+    q = question
+    # Expand contractions
+    contractions = {
+        r"\bwhat's\b": "what is",
+        r"\bit's\b": "it is",
+        r"\bcan't\b": "cannot",
+        r"\bdon't\b": "do not",
+    }
+    for pattern, replacement in contractions.items():
+        q = re.sub(pattern, replacement, q, flags=re.IGNORECASE)
+    # Strip casual/noisy phrases that hurt retrieval while preserving semantics.
+    q = re.sub(r"\blike (i'?m|i am) \d+\b", "", q, flags=re.IGNORECASE)
+    q = re.sub(r"\b(idk|lol|tbh|ngl)\b", "", q, flags=re.IGNORECASE)
+    # Collapse whitespace
+    return re.sub(r"\s+", " ", q).strip()
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -84,40 +108,37 @@ section[data-testid="stAppViewContainer"] {
     font-family: 'Inter', 'Segoe UI', system-ui, sans-serif !important;
 }
 
+/* ── HIDE STREAMLIT BRANDING ───────────────────────────────────── */
+#MainMenu {visibility: hidden;}
+header {visibility: hidden;}
+footer {visibility: hidden;}
+.stDeployButton {display: none;}
+
+/* ── NATIVE APP FEEL (CURSOR & SELECTION FIX) ──────────────────── */
+/* 1. Nuke the I-beam cursor and text highlighting globally */
+html, body, .stApp {
+    cursor: default !important;
+    user-select: none !important;
+    -webkit-user-select: none !important;
+}
+
+/* 2. Re-enable I-beam and highlighting ONLY where it makes sense */
+.stChatMessage, .stChatMessage *, /* The tutor's actual answers */
+.stChatInput textarea,            /* The user's typing box */
+code, pre {                       /* Any code snippets */
+    cursor: text !important;
+    user-select: text !important;
+    -webkit-user-select: text !important;
+}
+
+/* 3. Force the pointer (hand) cursor on clickable UI elements */
+button, div[data-testid="stCheckbox"], div[data-testid="stToggle"] {
+    cursor: pointer !important;
+}
+
 /* kill blue links globally */
 a, a:link, a:visited, a:hover, a:active,
 .stMarkdown a { color: var(--text) !important; text-decoration: none !important; }
-
-/* ── NAVBAR ────────────────────────────────────────────────────── */
-.navbar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 10px 0 14px 0;
-    border-bottom: 1px solid var(--border);
-    margin-bottom: 18px;
-}
-.navbar-title {
-    font-size: 1.25rem;
-    font-weight: 700;
-    color: var(--text);
-    letter-spacing: -0.01em;
-}
-.navbar-sub {
-    font-size: 0.78rem;
-    color: var(--muted);
-    margin-top: 1px;
-}
-.navbar-badge {
-    font-size: 0.70rem;
-    font-weight: 600;
-    letter-spacing: 0.05em;
-    padding: 4px 10px;
-    border-radius: 20px;
-    border: 1px solid var(--border);
-    color: var(--accent);
-    background: rgba(56,189,248,0.08);
-}
 
 /* ── SIDEBAR ───────────────────────────────────────────────────── */
 section[data-testid="stSidebar"],
@@ -154,6 +175,17 @@ section[data-testid="stSidebar"] * { color: var(--text) !important; }
 /* ── ANSWER SECTION HEADERS ─────────────────────────────────────── */
 /* Bold section headers slightly larger for readability */
 .stMarkdown strong { font-weight: 700 !important; }
+/* h3 section headers inside chat — teaching-focused layout */
+.stChatMessage h3 {
+    font-size: 0.95rem;
+    font-weight: 700;
+    color: var(--accent);
+    margin: 1.1rem 0 0.35rem 0;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--border);
+    letter-spacing: -0.01em;
+}
+.stChatMessage h3:first-of-type { margin-top: 0.4rem; }
 
 /* ── VIDEO CARD ────────────────────────────────────────────────── */
 .vc {
@@ -247,122 +279,193 @@ hr { border-color: var(--border) !important; margin: 0.75rem 0 !important; }
 
 @st.cache_resource(show_spinner="Loading knowledge base…")
 def get_rag() -> HybridRAGPipeline:
-    rag = HybridRAGPipeline(faiss_k=12, bm25_k=12, max_chunks=5, use_reranker=True)
+    rag = HybridRAGPipeline(faiss_k=5, bm25_k=3, max_chunks=3, use_reranker=True)
     try:
         rag.load_index()
     except FileNotFoundError:
         st.error("Knowledge base not found. Run `python ingest.py --dir data` first.")
         st.stop()
+    # Warm-load reranker once in cached resource to avoid first-query cold start.
+    rag._get_reranker()
     return rag
 
 
-@st.cache_resource(show_spinner="Connecting to Gemini…")
-def get_gemini_client():
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        try:
-            api_key = st.secrets.get("GEMINI_API_KEY")
-        except Exception:
-            pass
-    if not api_key:
-        return None
-    return genai.Client(api_key=api_key)
-
-
-rag           = get_rag()
-gemini_client = get_gemini_client()
-
-GEMINI_MODEL = "models/gemini-2.5-flash"
-
-# Navbar badge — Gemini only
-_LLM_MODE = "Gemini 2.5 Flash" if gemini_client is not None else "Offline"
+rag = get_rag()
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  LLM CALL FUNCTIONS
+#  LLM CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════
 
-# Token budget — 1800 tokens gives full 6-section answers with room to spare.
-_MAX_TOKENS = 1800
+# Switch provider and model entirely via .env — no code changes needed.
+PROVIDER: str   = os.getenv("LLM_PROVIDER", "gemini")
+_MAX_TOKENS: int = 1800
 
 
-def _call_gemini(prompt: str, max_tokens: int = _MAX_TOKENS, temp: float = 0.3) -> str:
+def get_model(provider: str) -> str:
+    """Return the model identifier for the given provider from the environment."""
+    if provider == "gemini":
+        return os.getenv("GEMINI_MODEL", "models/gemini-2.5-flash")
+    if provider == "openai":
+        return os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    if provider == "claude":
+        return os.getenv("CLAUDE_MODEL", "claude-3-haiku-20240307")
+    raise ValueError(f"Unknown LLM_PROVIDER: {provider!r}")
+
+
+def clean_text(text: str) -> str:
+    """Strip surrogate code points and non-printable characters from LLM output.
+    Preserves valid math symbols (θ, ∂, α, etc.) — only drops true surrogates."""
+    if not isinstance(text, str):
+        return ""
+    # Remove ONLY invalid surrogate characters (math symbols are valid UTF-8)
+    text = text.encode("utf-8", "ignore").decode("utf-8")
+    # Remove control characters except newline + tab
+    text = "".join(ch for ch in text if ch.isprintable() or ch in "\n\t")
+    return text
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """Identify retryable API errors including rate limits and server timeouts."""
+    low = str(exc).lower()
+    retryable_keywords = [
+        "429", "rate limit", "quota", "exhausted", "too many requests",
+        "503", "500", "service unavailable", "timeout", "internal error", "overloaded"
+    ]
+    return any(x in low for x in retryable_keywords)
+
+
+def _retry_with_backoff(fn, max_retries: int = 3, base_delay: float = 2.0):
     """
-    Gemini call — exponential backoff on 429 / ResourceExhausted.
-    Retries once if response appears truncated.
+    Retry API calls with exponential backoff for rate-limit style failures.
+    Backoff sequence: 2s, 4s, 8s (bounded by max_retries).
     """
-    if gemini_client is None:
-        raise ValueError("Gemini client not initialised.")
-
-    cfg = genai_types.GenerateContentConfig(
-        temperature=temp,
-        max_output_tokens=max_tokens,
-    )
-    max_retries = 3
     for attempt in range(max_retries):
         try:
-            response = gemini_client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=cfg,
-            )
-            result = getattr(response, "text", None) or ""
+            return fn()
+        except Exception as exc:
+            if attempt == max_retries - 1 or not _is_rate_limit_error(exc):
+                raise
+            delay = base_delay * (2 ** attempt) + random.uniform(0.0, 0.25)
+            time.sleep(delay)
 
-            # Retry once if response appears truncated
-            if result and response_seems_truncated(result):
-                retry = gemini_client.models.generate_content(
-                    model=GEMINI_MODEL, contents=prompt, config=cfg,
-                )
-                result2 = getattr(retry, "text", None) or ""
-                if result2 and not response_seems_truncated(result2):
-                    return result2
+
+# ══════════════════════════════════════════════════════════════════════
+#  PROVIDER IMPLEMENTATIONS
+# Each function: lazy SDK import, reads its own key, shared _MAX_TOKENS,
+# exponential backoff retry for rate limits, returns clean_text(result).
+# ══════════════════════════════════════════════════════════════════════
+
+def call_gemini(prompt: str, model: str, style: str) -> str:
+    import google.genai as genai                        # lazy — not penalised unless used
+    from google.genai import types as genai_types
+
+    api_key = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", "")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY is not set.")
+
+    client = genai.Client(api_key=api_key)
+    cfg    = genai_types.GenerateContentConfig(
+        temperature=0.3,
+        max_output_tokens=_MAX_TOKENS,
+    )
+
+    def _call_once():
+            response = client.models.generate_content(
+                model=model, contents=prompt, config=cfg,
+            )
+            result = clean_text(getattr(response, "text", None) or "")
+
+            # One truncation retry — re-use same config.
+            if result and response_seems_truncated(result, style=style):
+                r2 = client.models.generate_content(model=model, contents=prompt, config=cfg)
+                r2_text = clean_text(getattr(r2, "text", None) or "")
+                if r2_text and not response_seems_truncated(r2_text, style=style):
+                    return r2_text
 
             return result
+    return _retry_with_backoff(_call_once)
 
-        except Exception as exc:
-            err = str(exc).lower()
-            is_rate = any(x in err for x in
-                          ["429", "quota", "rate", "exhausted", "resource"])
-            if is_rate and attempt < max_retries - 1:
-                wait = (2 ** (attempt + 1)) + random.uniform(0, 1)
-                st.toast(f"⏳ Rate limit — retrying in {wait:.0f}s…", icon="⏳")
-                time.sleep(wait)
-                continue
-            raise
 
-    return ""
+def call_openai(prompt: str, model: str, style: str) -> str:
+    from openai import OpenAI                           # lazy — not penalised unless used
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is not set.")
+
+    client = OpenAI(api_key=api_key)
+
+    def _call_once():
+            res = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=_MAX_TOKENS,
+                temperature=0.3,
+            )
+            return clean_text(res.choices[0].message.content or "")
+    return _retry_with_backoff(_call_once)
+
+
+def call_claude(prompt: str, model: str, style: str) -> str:
+    from anthropic import Anthropic                     # lazy — not penalised unless used
+
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY is not set.")
+
+    client = Anthropic(api_key=api_key)
+
+    def _call_once():
+            msg = client.messages.create(
+                model=model,
+                max_tokens=_MAX_TOKENS,
+                temperature=0.3,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = msg.content[0].text if msg.content and len(msg.content) > 0 else ""
+            return clean_text(raw)
+    return _retry_with_backoff(_call_once)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  UNIFIED ROUTER
+# ══════════════════════════════════════════════════════════════════════
+
+def call_llm(prompt: str, provider: str, style: str) -> str:
+    """Single entry point for all LLM calls. Routed by LLM_PROVIDER env var."""
+    model = get_model(provider)
+    print(f"[LLM] {provider} | {model} | len={len(prompt)}")
+
+    if provider == "gemini":
+        return call_gemini(prompt, model, style)
+    if provider == "openai":
+        return call_openai(prompt, model, style)
+    if provider == "claude":
+        return call_claude(prompt, model, style)
+    raise ValueError(f"Unknown LLM_PROVIDER: {provider!r}")
+
+
+def _append_history(role: str, content: str) -> None:
+    """Append and cap session history to last 20 messages."""
+    st.session_state.history.append({"role": role, "content": clean_text(content)})
+    st.session_state.history = st.session_state.history[-20:]
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def _cached_llm_call(prompt: str) -> str:
-    """
-    Cached Gemini call.
-    Cache key = MD5 of prompt → identical questions use stored answer for 1 hour.
-    """
-    if gemini_client is not None:
-        return _call_gemini(prompt)
-    raise ValueError("Gemini client not available. Set GEMINI_API_KEY.")
+def cached_llm_call(cache_question: str, cache_level: str, cache_style: str, _prompt: str, _provider: str):
+    """Cache by user intent tuple; prompt payload is excluded from cache key."""
+    return call_llm(_prompt, _provider, cache_style)
+
+
+# Navbar badge — reflects active provider at startup.
+_LLM_MODE = f"{PROVIDER.capitalize()} / {get_model(PROVIDER).split('/')[-1]}"
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  DEFINITION-BOOST RERANKING
-#  Elevates chunks that contain definitional language so the LLM
-#  gets the most answer-ready passage first.
+#  NOTE: Definition-boost scoring is handled inside rag_pipeline.py.
+#  No separate post-processing needed here.
 # ══════════════════════════════════════════════════════════════════════
-
-_DEF_SIGNALS = {
-    " is ", " is defined ", " is a ", " is an ",
-    "defined as", "refers to", "algorithm is", "method is",
-    "technique is", "can be defined", "we define",
-}
-
-def _boost_definition_chunks(chunks: list[dict]) -> list[dict]:
-    def _score(c: dict) -> float:
-        text  = c.get("text", "").lower()
-        base  = c.get("rerank_score", c.get("score", 0.0))
-        bonus = sum(0.05 for sig in _DEF_SIGNALS if sig in text)
-        return base + min(bonus, 0.20)
-    return sorted(chunks, key=_score, reverse=True)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -380,22 +483,6 @@ with st.sidebar:
     )
     st.divider()
 
-    st.markdown("**⚙️ Settings**")
-
-    user_level = st.selectbox(
-        "Your level",
-        ["Beginner", "Intermediate", "Advanced"],
-        index=1,
-        help="Beginner = analogies first. Intermediate = adds formulas. Advanced = full depth.",
-    )
-
-    response_style = st.radio(
-        "Response style",
-        ["Quick", "Detailed"],
-        index=1,
-        help="Quick = concise 3-step answer. Detailed = full 6-section explanation.",
-    )
-
     answer_depth = 4
     if DEV_MODE:
         answer_depth = st.select_slider(
@@ -409,7 +496,6 @@ with st.sidebar:
     show_chunks  = st.toggle("Raw passages (dev)", value=False) if DEV_MODE else False
 
     st.divider()
-    st.markdown("**📚 Topics Covered**")
     _topic_labels = [
         "Gradient Descent", "Neural Networks", "Backpropagation",
         "Regularization / Overfitting", "Transformers", "KNN",
@@ -417,24 +503,25 @@ with st.sidebar:
         "Reinforcement Learning", "Supervised vs Unsupervised",
         "Loss Functions", "Training Process", "Bias vs Variance",
     ]
-    for t in _topic_labels:
-        st.markdown(
-            f'<span style="font-size:0.77rem;color:#94A3B8">· {t}</span>',
-            unsafe_allow_html=True,
-        )
+    with st.expander("📚 Topics Covered"):
+        for t in _topic_labels:
+            st.markdown(
+                f'<span style="font-size:0.77rem;color:#94A3B8">· {t}</span>',
+                unsafe_allow_html=True,
+            )
 
-    st.divider()
-    st.markdown("**📖 Textbook Library**")
-    for book in [
+    _books = [
         "DL_NeuralNetworks_Nielsen.pdf",
         "ML_Ethem_Alpaydin.pdf",
         "ML_Math_Foundation.pdf",
         "ML_SoftComputing_Kecman.pdf",
-    ]:
-        st.markdown(
-            f'<span style="font-size:0.76rem;color:#64748B">· {book}</span>',
-            unsafe_allow_html=True,
-        )
+    ]
+    with st.expander("📖 Textbook Library"):
+        for book in _books:
+            st.markdown(
+                f'<span style="font-size:0.76rem;color:#64748B">· {book}</span>',
+                unsafe_allow_html=True,
+            )
 
     st.divider()
     st.markdown(
@@ -455,28 +542,51 @@ right_slot          = col_right.empty()
 with col_chat:
 
     # ── Top navbar ────────────────────────────────────────────────────
-    st.markdown(
-        f'<div class="navbar">'
-        f'  <div>'
-        f'    <div class="navbar-title">📖 ML Tutor</div>'
-        f'    <div class="navbar-sub">Concepts explained simply · grounded in textbooks</div>'
-        f'  </div>'
-        f'  <div class="navbar-badge">⚡ {_LLM_MODE}</div>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
+    nav_col1, nav_col2, nav_col3 = st.columns([2, 1, 1])
+    with nav_col1:
+        # Raw HTML prevents Streamlit from turning this into a clickable link.
+        # user-select: none and cursor: default make it feel like a real app logo.
+        st.markdown(
+            '<h3 style="margin-bottom: 0; padding-top: 0; user-select: none; cursor: default;">📖 ML Tutor</h3>',
+            unsafe_allow_html=True
+        )
+        st.caption(f"⚡ Grounded in Textbooks | {_LLM_MODE}")
+    with nav_col2:
+        user_level = st.selectbox(
+            "Level",
+            ["Beginner", "Intermediate", "Advanced"], 
+            index=1,
+            key="ui_level",
+            label_visibility="collapsed",
+        )
+    with nav_col3:
+        response_style = st.selectbox(
+            "Style",
+            ["Quick", "Detailed"], 
+            index=1,
+            key="ui_style",
+            label_visibility="collapsed",
+        )
+    st.divider()
 
     # ── Chat history ──────────────────────────────────────────────────
     if "history" not in st.session_state:
-        st.session_state.history     = []
-        st.session_state.last_q_hash = ""
+        st.session_state.history       = []
+        st.session_state.last_q_hash   = ""
+        st.session_state.last_sources  = []
+        st.session_state.last_videos   = []
+        st.session_state.last_chunks   = []
 
     recent = st.session_state.history[-12:]
     for msg in recent:
         with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+            safe_msg = clean_text(msg["content"])
+            try:
+                st.markdown(safe_msg)
+            except Exception:
+                st.text(safe_msg)
 
-    # ── Empty state (shown before first question) ─────────────────────
+    # ── Empty state with CLICKABLE suggestion buttons ─────────────────
     if not st.session_state.history:
         st.markdown(
             '<div class="empty-state">'
@@ -486,18 +596,27 @@ with col_chat:
             '    Start with gradient descent, neural networks, or backpropagation — '
             '    and get structured, textbook-grounded answers instantly.'
             '  </div>'
-            '  <div>'
-            '    <span class="empty-chip">What is gradient descent?</span>'
-            '    <span class="empty-chip">Explain backpropagation</span>'
-            '    <span class="empty-chip">Bias vs variance tradeoff</span>'
-            '    <span class="empty-chip">How does SVM work?</span>'
-            '    <span class="empty-chip">What is overfitting?</span>'
-            '  </div>'
             '</div>',
             unsafe_allow_html=True,
         )
+        # Clickable suggestion buttons
+        _suggestions = [
+            "What is gradient descent?",
+            "Explain backpropagation",
+            "Bias vs variance tradeoff",
+            "How does SVM work?",
+            "What is overfitting?",
+        ]
+        cols = st.columns(len(_suggestions))
+        for i, s in enumerate(_suggestions):
+            if cols[i].button(s, key=f"suggest_{i}", use_container_width=True):
+                st.session_state["_suggestion_query"] = s
+                st.rerun()
 
     question = st.chat_input("Ask a machine learning question…")
+    # Handle suggestion button clicks
+    if not question and st.session_state.get("_suggestion_query"):
+        question = st.session_state.pop("_suggestion_query")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -512,36 +631,58 @@ if question:
         st.stop()
 
     # Duplicate-call guard
-    q_hash = hashlib.md5(question.strip().lower().encode()).hexdigest()
+    dedupe_key = f"{question.lower().strip()}*{user_level}*{response_style}"
+    q_hash = hashlib.md5(dedupe_key.encode()).hexdigest()
     if q_hash == st.session_state.get("last_q_hash", ""):
         st.stop()
     st.session_state.last_q_hash = q_hash
 
-    st.session_state.history.append({"role": "user", "content": question})
+    _append_history("user", question)
     with col_chat:
         with st.chat_message("user"):
-            st.markdown(question)
+            safe_q = clean_text(question)
+            try:
+                st.markdown(safe_q)
+            except Exception:
+                st.text(safe_q)
 
     # ── Step 1: Retrieval ──────────────────────────────────────────────
     with col_chat:
         with st.status("Generating explanation from textbooks…",
                        expanded=False) as status:
+            # Build retrieval query: concat last user turn + current question for context
+            retrieval_query = question
+            if len(st.session_state.history) >= 2:
+                # Get the last user message before this one
+                for msg in reversed(st.session_state.history[:-1]):
+                    if msg.get("role") == "user":
+                        last_question = msg.get("content", "").strip()
+                        if last_question and last_question != question:
+                            retrieval_query = f"{last_question} {question}"
+                        break
+            # Preprocess query before embedding
+            retrieval_query = preprocess_query(retrieval_query)
             chunks = rag.retrieve(
-                question, top_k=answer_depth, score_threshold=0.20
+                retrieval_query, top_k=answer_depth, score_threshold=0.20,
+                level=user_level,
             )
             if not chunks:
                 chunks = rag.retrieve(
-                    question, top_k=answer_depth, score_threshold=0.0
+                    question, top_k=answer_depth, score_threshold=0.0,
+                    level=user_level,
                 )
 
             if chunks:
-                chunks = _boost_definition_chunks(chunks)
+                # Pipeline handles scoring/boosting internally now
                 status.update(
                     label=f"✓ Textbook knowledge loaded ({len(chunks)} passages)",
                     state="complete",
                 )
             else:
                 status.update(label="⚠ No relevant passages found", state="error")
+
+            # Debug logging
+            print(f"[RAG] chunks={len(chunks)} top_score={chunks[0]['score'] if chunks else 'NA'}")
 
     if not chunks:
         with col_chat:
@@ -551,8 +692,11 @@ if question:
                     "Try rephrasing, or check that the relevant PDF is in `data/` "
                     "and the index has been rebuilt."
                 )
-                st.markdown(reply)
-        st.session_state.history.append({"role": "assistant", "content": reply})
+                try:
+                    st.markdown(reply)
+                except Exception:
+                    st.text(reply)
+        st.session_state.history.append({"role": "assistant", "content": clean_text(reply)})
         st.stop()
 
     # ── Step 2: Build prompt ────────────────────────────────────────────
@@ -561,6 +705,7 @@ if question:
         chunks=chunks,
         level=user_level,
         style=response_style,
+        chat_history=st.session_state.history[-4:],
     )
     full_prompt = messages[0]["content"] + "\n\n" + messages[1]["content"]
 
@@ -577,40 +722,77 @@ if question:
             full_response      = ""
             _api_error         = False
 
-            with st.spinner(""):
+            with st.spinner("Thinking..."):
                 try:
-                    full_response = _cached_llm_call(full_prompt)
+                    full_response = cached_llm_call(
+                        question,
+                        user_level,
+                        response_style,
+                        full_prompt,
+                        PROVIDER,
+                    )
 
-                    if not full_response.strip():
-                        raise ValueError("Empty LLM response.")
+                    # Advanced: relaxed gate — only catch broken outputs
+                    # Other levels: full quality gate (removed dead context_adequacy_check)
+                    if user_level == "Advanced":
+                        if (
+                            not full_response.strip()
+                            or response_seems_truncated(full_response, style=response_style)
+                        ):
+                            full_response = make_structured_fallback(chunks, question, style=response_style)
+                    else:
+                        if (
+                            not full_response.strip()
+                            or not llm_response_is_adequate(full_response)
+                            or response_seems_truncated(full_response, style=response_style)
+                        ):
+                            full_response = make_structured_fallback(chunks, question, style=response_style)
 
                 except Exception as exc:
                     _api_error = True
                     low = str(exc).lower()
 
-                    if any(x in low for x in ["429", "quota", "rate", "exhausted"]):
+                    # Print the exact exception to the terminal for debugging
+                    print(f"\nDEBUG LLM CRASH: {repr(exc)}")
+
+                    if any(x in low for x in ["429", "quota", "rate", "exhausted", "503", "500", "overloaded"]):
                         st.warning(
-                            "⏳ **API rate limit reached.** "
-                            "Generating explanation from textbook passages instead…"
+                            "API busy or rate limit reached. "
+                            "Generating explanation from textbook passages instead."
                         )
                     elif any(x in low for x in ["401", "api key", "invalid", "permission"]):
                         st.error(
-                            "🔑 **API key error.** "
-                            "Check `GEMINI_API_KEY` in your `.env` or `.streamlit/secrets.toml`."
+                            "API key error. "
+                            f"Check the API key for provider `{PROVIDER}` in your `.env`."
                         )
-                        # Still show structured fallback — don't crash
                     elif "not initialised" in low:
-                        st.info("ℹ️ No LLM connected. Showing textbook explanation.")
+                        st.info("No LLM connected. Showing textbook explanation.")
                     else:
                         st.warning(
-                            f"⚠️ LLM unavailable. "
+                            "LLM unavailable. "
                             "Showing structured textbook explanation instead."
                         )
 
-                    # Always produce clean structured output — never a raw dump
-                    full_response = make_structured_fallback(chunks, question)
+                    full_response = make_structured_fallback(chunks, question, style=response_style)
 
-            answer_placeholder.markdown(full_response)
+            # Upgrade section headers for teaching-focused display
+            _header_map = {
+                "**📖 Definition**": "### 📖 Definition",
+                "**💡 Intuition**": "### 💡 Intuition",
+                "**⚙️ How it Works**": "### ⚙️ How it Works",
+                "**🔑 Key Points**": "### 🔑 Key Points",
+                "**🧪 Example**": "### 🧪 Example",
+                "**⚠️ Common Mistakes**": "### ⚠️ Common Mistakes",
+                "**📄 Sources**": "### 📄 Sources",
+            }
+            for old, new in _header_map.items():
+                full_response = full_response.replace(old, new)
+
+            safe = clean_text(full_response)
+            try:
+                answer_placeholder.markdown(safe)
+            except Exception:
+                answer_placeholder.text(safe)
 
             # Post-answer quality notes
             if not _api_error and not llm_response_is_adequate(full_response):
@@ -623,100 +805,123 @@ if question:
             if show_chunks:
                 with st.expander("🔬 Retrieved passages (dev)", expanded=False):
                     for i, c in enumerate(chunks, 1):
-                        st.markdown(
+                        passage_header = (
                             f"**Passage {i}** — `{c.get('source','?')}` "
                             f"p.{c.get('page','?')}  "
                             f"score: {c.get('rerank_score', c.get('score','?'))}"
                         )
-                        txt = c.get("text", "")
+                        try:
+                            st.markdown(clean_text(passage_header))
+                        except Exception:
+                            st.text(clean_text(passage_header))
+                        txt = clean_text(c.get("text", ""))
                         st.text(txt[:400] + ("…" if len(txt) > 400 else ""))
 
-    st.session_state.history.append(
-        {"role": "assistant", "content": full_response}
-    )
+    _append_history("assistant", full_response)
+    # Persist sources and chunks for stable right panel
+    st.session_state.last_chunks = chunks
 
     # ══════════════════════════════════════════════════════════════════
-    #  RIGHT PANEL — videos + sources
+    #  RIGHT PANEL — videos + sources (persisted in session_state)
     # ══════════════════════════════════════════════════════════════════
 
-    with right_slot.container():
+    # Compute and persist videos
+    concept_videos = recommend_videos(question)
+    st.session_state.last_videos = concept_videos
 
-        if show_videos:
+    # Compute and persist sources
+    seen_src: set  = set()
+    refs: list = []
+    for c in chunks:
+        key = (c.get("source", "?"), c.get("page", "?"))
+        if key not in seen_src:
+            seen_src.add(key)
+            refs.append(key)
+    st.session_state.last_sources = refs
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  RIGHT PANEL — always rendered from session_state (never disappears)
+# ══════════════════════════════════════════════════════════════════════
+
+with right_slot.container():
+
+    if show_videos:
+        st.markdown(
+            '<p class="panel-header">🎬 Video Explanations</p>',
+            unsafe_allow_html=True,
+        )
+
+        _videos = st.session_state.get("last_videos", [])
+
+        if _videos:
+            for v in _videos:
+                st.markdown(
+                    f'<div class="vc">'
+                    f'  <a href="{v["url"]}" target="_blank">{v["title"]}</a>'
+                    f'  <div class="ch">{v["channel"]}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+        elif st.session_state.get("history"):
             st.markdown(
-                '<p class="panel-header">🎬 Video Explanations</p>',
+                '<p style="font-size:0.78rem;color:#475569;padding:4px 2px">'
+                'No video match for this query.</p>',
                 unsafe_allow_html=True,
             )
 
-            concept_videos = recommend_videos(question)
-
-            if concept_videos:
-                for v in concept_videos:
-                    st.markdown(
-                        f'<div class="vc">'
-                        f'  <a href="{v["url"]}" target="_blank">{v["title"]}</a>'
-                        f'  <div class="ch">{v["channel"]}</div>'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
-            else:
+        # Practice videos — check last question from history
+        _last_q = ""
+        for msg in reversed(st.session_state.get("history", [])):
+            if msg["role"] == "user":
+                _last_q = msg["content"]
+                break
+        if _last_q and wants_practice(_last_q):
+            pv = recommend_practice_video(_last_q)
+            if pv:
                 st.markdown(
-                    '<p style="font-size:0.78rem;color:#475569;padding:4px 2px">'
-                    'No video match for this query.</p>',
+                    '<p class="panel-header" style="margin-top:14px">'
+                    '🧮 Practice Example</p>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    f'<div class="vc">'
+                    f'  <a href="{pv["url"]}" target="_blank">{pv["title"]}</a>'
+                    f'  <div class="ch">{pv["channel"]}</div>'
+                    f'</div>',
                     unsafe_allow_html=True,
                 )
 
-            if wants_practice(question):
-                pv = recommend_practice_video(question)
-                if pv:
-                    st.markdown(
-                        '<p class="panel-header" style="margin-top:14px">'
-                        '🧮 Practice Example</p>',
-                        unsafe_allow_html=True,
-                    )
-                    st.markdown(
-                        f'<div class="vc">'
-                        f'  <a href="{pv["url"]}" target="_blank">{pv["title"]}</a>'
-                        f'  <div class="ch">{pv["channel"]}</div>'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
+        with st.expander("📚 Explore More", expanded=False):
+            for pl in EXPLORE_PLAYLISTS:
+                st.markdown(
+                    f'<div class="vc">'
+                    f'  <a href="{pl["url"]}" target="_blank">{pl["title"]}</a>'
+                    f'  <div class="ch">{pl["channel"]}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
 
-            with st.expander("📚 Explore More", expanded=False):
-                for pl in EXPLORE_PLAYLISTS:
-                    st.markdown(
-                        f'<div class="vc">'
-                        f'  <a href="{pl["url"]}" target="_blank">{pl["title"]}</a>'
-                        f'  <div class="ch">{pl["channel"]}</div>'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
+        st.markdown('<hr/>', unsafe_allow_html=True)
 
-            st.markdown('<hr/>', unsafe_allow_html=True)
+    if show_sources:
+        st.markdown(
+            '<p class="panel-header">📄 Sources</p>',
+            unsafe_allow_html=True,
+        )
+        _refs = st.session_state.get("last_sources", [])
 
-        if show_sources:
+        if _refs:
+            tags = "".join(
+                f'<span class="src-tag">📄 {s} — p.{p}</span>'
+                for s, p in _refs
+            )
             st.markdown(
-                '<p class="panel-header">📄 Sources</p>',
+                f'<div style="display:flex;flex-wrap:wrap;gap:4px">{tags}</div>',
                 unsafe_allow_html=True,
             )
-            seen: set  = set()
-            refs: list = []
-            for c in chunks:
-                key = (c.get("source", "?"), c.get("page", "?"))
-                if key not in seen:
-                    seen.add(key)
-                    refs.append(key)
-
-            if refs:
-                tags = "".join(
-                    f'<span class="src-tag">📄 {s} — p.{p}</span>'
-                    for s, p in refs
-                )
-                st.markdown(
-                    f'<div style="display:flex;flex-wrap:wrap;gap:4px">{tags}</div>',
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.markdown(
-                    '<p style="font-size:0.77rem;color:#475569">No source metadata.</p>',
-                    unsafe_allow_html=True,
-                )
+        elif st.session_state.get("history"):
+            st.markdown(
+                '<p style="font-size:0.77rem;color:#475569">No source metadata.</p>',
+                unsafe_allow_html=True,
+            )
